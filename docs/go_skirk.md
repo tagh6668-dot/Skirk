@@ -57,6 +57,15 @@ Restricted network substrate:
 go run ./cmd/skirk e2e --config skirk.json --bytes 2048 --delete-after
 ```
 
+Throughput:
+
+```sh
+go run ./cmd/skirk bench \
+  --config skirk.json \
+  --sizes 65536,1048576 \
+  --chunk-sizes 65536,262144
+```
+
 SOCKS path:
 
 Run an exit:

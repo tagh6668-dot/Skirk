@@ -70,54 +70,74 @@ func HybridSendFile(ctx context.Context, data BlobStore, control BlobStore, inpu
 		return HybridSendResult{}, err
 	}
 	defer input.Close()
+	stat, err := input.Stat()
+	if err != nil {
+		return HybridSendResult{}, err
+	}
 
 	var result HybridSendResult
 	result.SessionID = SessionString(sid)
 	buffer := make([]byte, chunkSize)
+	if stat.Size() == 0 {
+		if err := sendHybridChunk(ctx, data, control, key, sid, direction, 0, nil, true, &result); err != nil {
+			return HybridSendResult{}, err
+		}
+		return result, nil
+	}
+	remaining := stat.Size()
 	for {
-		n, readErr := io.ReadFull(input, buffer)
-		if readErr == io.ErrUnexpectedEOF || readErr == io.EOF {
-			// Send an explicit final chunk, including a zero-byte chunk for empty files.
-		} else if readErr != nil {
+		n, readErr := input.Read(buffer)
+		if n == 0 && readErr == io.EOF {
+			break
+		}
+		if readErr != nil && readErr != io.EOF {
 			return HybridSendResult{}, readErr
 		}
 		chunk := buffer[:n]
-		final := readErr == io.ErrUnexpectedEOF || readErr == io.EOF
-		dataName := fileDataName(sid, direction, uint64(result.Chunks))
-		sealed, err := Seal(key, sid, direction, uint64(result.Chunks), chunk, final)
-		if err != nil {
+		remaining -= int64(n)
+		final := remaining == 0
+		if err := sendHybridChunk(ctx, data, control, key, sid, direction, uint64(result.Chunks), chunk, final, &result); err != nil {
 			return HybridSendResult{}, err
 		}
-		if err := data.Put(ctx, dataName, sealed); err != nil {
-			return HybridSendResult{}, err
-		}
-		controlName := fileControlName(sid, direction, uint64(result.Chunks))
-		payload := ControlPayload{
-			Version:     1,
-			Event:       "CHUNK_READY",
-			SessionID:   SessionString(sid),
-			Direction:   directionName(direction),
-			Sequence:    uint64(result.Chunks),
-			DriveObject: dataName,
-			Bytes:       n,
-			Final:       final,
-		}
-		payloadBytes, err := json.Marshal(payload)
-		if err != nil {
-			return HybridSendResult{}, err
-		}
-		if err := control.Put(ctx, controlName, payloadBytes); err != nil {
-			return HybridSendResult{}, err
-		}
-		result.DriveObjects = append(result.DriveObjects, dataName)
-		result.ControlRows = append(result.ControlRows, controlName)
-		result.BytesPlaintext += int64(n)
-		result.Chunks++
 		if final {
 			break
 		}
 	}
 	return result, nil
+}
+
+func sendHybridChunk(ctx context.Context, data BlobStore, control BlobStore, key []byte, sid [16]byte, direction byte, sequence uint64, chunk []byte, final bool, result *HybridSendResult) error {
+	dataName := fileDataName(sid, direction, sequence)
+	sealed, err := Seal(key, sid, direction, sequence, chunk, final)
+	if err != nil {
+		return err
+	}
+	if err := data.Put(ctx, dataName, sealed); err != nil {
+		return err
+	}
+	controlName := fileControlName(sid, direction, sequence)
+	payload := ControlPayload{
+		Version:     1,
+		Event:       "CHUNK_READY",
+		SessionID:   SessionString(sid),
+		Direction:   directionName(direction),
+		Sequence:    sequence,
+		DriveObject: dataName,
+		Bytes:       len(chunk),
+		Final:       final,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if err := control.Put(ctx, controlName, payloadBytes); err != nil {
+		return err
+	}
+	result.DriveObjects = append(result.DriveObjects, dataName)
+	result.ControlRows = append(result.ControlRows, controlName)
+	result.BytesPlaintext += int64(len(chunk))
+	result.Chunks++
+	return nil
 }
 
 func HybridReceiveFile(ctx context.Context, data BlobStore, control BlobStore, outputPath, secret, sessionID string, direction byte, deleteAfter bool) (HybridReceiveResult, error) {

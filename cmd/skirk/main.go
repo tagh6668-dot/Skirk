@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"skirk/internal/skirk"
@@ -47,6 +49,8 @@ func run(args []string) error {
 		return hybridRecv(ctx, args[2:])
 	case "e2e":
 		return e2e(ctx, args[2:])
+	case "bench":
+		return bench(ctx, args[2:])
 	case "serve-client":
 		return serveClient(ctx, args[2:])
 	case "serve-exit":
@@ -68,6 +72,7 @@ func usage() {
   hybrid-send --config skirk.json --input file.bin [--session SESSION]
   hybrid-recv --config skirk.json --output file.bin --session SESSION [--delete-after]
   e2e --config skirk.json [--bytes 2048] [--delete-after]
+  bench --config skirk.json --sizes 8192,65536 --chunk-sizes 8192,65536 [--temp-workspace]
   serve-exit --config skirk.json
   serve-client --config skirk.json [--listen 127.0.0.1:18080]`)
 }
@@ -237,6 +242,179 @@ func e2e(ctx context.Context, args []string) error {
 		"chunk_size":     cfg.Tunnel.ChunkSize,
 		"spreadsheet_id": cfg.Sheets.SpreadsheetID,
 	})
+}
+
+type benchCase struct {
+	SizeBytes     int     `json:"size_bytes"`
+	ChunkSize     int     `json:"chunk_size"`
+	SendChunks    int     `json:"send_chunks"`
+	ReceiveChunks int     `json:"receive_chunks"`
+	SendMS        int64   `json:"send_ms"`
+	ReceiveMS     int64   `json:"receive_ms"`
+	VerifyMS      int64   `json:"verify_ms"`
+	CleanupMS     int64   `json:"cleanup_ms"`
+	SendMbps      float64 `json:"send_mbps"`
+	ReceiveMbps   float64 `json:"receive_mbps"`
+	RoundTripMbps float64 `json:"roundtrip_mbps"`
+	SessionID     string  `json:"session_id"`
+}
+
+func bench(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("bench", flag.ExitOnError)
+	configPath := fs.String("config", "skirk.json", "config path")
+	sizesText := fs.String("sizes", "8192,65536", "comma-separated payload sizes in bytes")
+	chunksText := fs.String("chunk-sizes", "8192,65536", "comma-separated chunk sizes in bytes")
+	tempWorkspace := fs.Bool("temp-workspace", false, "create and delete a temporary control spreadsheet")
+	title := fs.String("title", "skirk-bench", "temporary spreadsheet title")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	sizes, err := parseIntList(*sizesText)
+	if err != nil {
+		return err
+	}
+	chunkSizes, err := parseIntList(*chunksText)
+	if err != nil {
+		return err
+	}
+	cfg, drive, sheets, workspace, err := load(*configPath)
+	if err != nil {
+		return err
+	}
+	tempSheetID := ""
+	if *tempWorkspace {
+		tempSheetID, err = workspace.CreateSpreadsheet(ctx, *title, "skirk")
+		if err != nil {
+			return err
+		}
+		cfg.Sheets.SpreadsheetID = tempSheetID
+		drive, sheets, _, err = skirk.StoresFromConfig(ctx, cfg)
+		if err != nil {
+			_ = workspace.DeleteSpreadsheet(ctx, tempSheetID)
+			return err
+		}
+		defer workspace.DeleteSpreadsheet(context.Background(), tempSheetID)
+	}
+	if cfg.Sheets.SpreadsheetID == "" {
+		return fmt.Errorf("config.sheets.spreadsheet_id is required unless --temp-workspace is used")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "skirk-bench-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	var cases []benchCase
+	for _, size := range sizes {
+		payload := make([]byte, size)
+		if _, err := rand.Read(payload); err != nil {
+			return err
+		}
+		input := filepath.Join(tmpDir, fmt.Sprintf("input-%d.bin", size))
+		if err := os.WriteFile(input, payload, 0600); err != nil {
+			return err
+		}
+		for _, chunkSize := range chunkSizes {
+			output := filepath.Join(tmpDir, fmt.Sprintf("output-%d-%d.bin", size, chunkSize))
+			startSend := time.Now()
+			send, err := skirk.HybridSendFile(ctx, drive, sheets, input, cfg.Secret, "", skirk.DirectionUp, chunkSize, false)
+			sendDuration := time.Since(startSend)
+			if err != nil {
+				return err
+			}
+
+			startReceive := time.Now()
+			recv, err := skirk.HybridReceiveFile(ctx, drive, sheets, output, cfg.Secret, send.SessionID, skirk.DirectionUp, false)
+			receiveDuration := time.Since(startReceive)
+			if err != nil {
+				_ = cleanupHybrid(ctx, drive, sheets, send.DriveObjects, send.ControlRows)
+				return err
+			}
+
+			startVerify := time.Now()
+			roundtrip, err := os.ReadFile(output)
+			if err != nil {
+				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows)
+				return err
+			}
+			if !bytes.Equal(payload, roundtrip) {
+				_ = cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows)
+				return fmt.Errorf("payload mismatch for size=%d chunk=%d", size, chunkSize)
+			}
+			verifyDuration := time.Since(startVerify)
+
+			startCleanup := time.Now()
+			if err := cleanupHybrid(ctx, drive, sheets, recv.DriveObjects, recv.ControlRows); err != nil {
+				return err
+			}
+			cleanupDuration := time.Since(startCleanup)
+			sendSeconds := sendDuration.Seconds()
+			receiveSeconds := receiveDuration.Seconds()
+			roundTripSeconds := sendSeconds + receiveSeconds
+			cases = append(cases, benchCase{
+				SizeBytes:     size,
+				ChunkSize:     chunkSize,
+				SendChunks:    send.Chunks,
+				ReceiveChunks: recv.Chunks,
+				SendMS:        sendDuration.Milliseconds(),
+				ReceiveMS:     receiveDuration.Milliseconds(),
+				VerifyMS:      verifyDuration.Milliseconds(),
+				CleanupMS:     cleanupDuration.Milliseconds(),
+				SendMbps:      mbps(size, sendSeconds),
+				ReceiveMbps:   mbps(size, receiveSeconds),
+				RoundTripMbps: mbps(size, roundTripSeconds),
+				SessionID:     send.SessionID,
+			})
+		}
+	}
+	return printJSON(map[string]any{
+		"result":              "pass",
+		"temp_spreadsheet_id": tempSheetID,
+		"cases":               cases,
+	})
+}
+
+func cleanupHybrid(ctx context.Context, drive *skirk.DriveStore, sheets *skirk.SheetsLog, dataObjects, controlRows []string) error {
+	for _, name := range dataObjects {
+		if err := drive.Delete(ctx, name); err != nil {
+			return err
+		}
+	}
+	for _, name := range controlRows {
+		if err := sheets.Delete(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseIntList(value string) ([]int, error) {
+	var result []int
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		parsed, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid integer %q: %w", part, err)
+		}
+		if parsed <= 0 {
+			return nil, fmt.Errorf("sizes must be positive: %d", parsed)
+		}
+		result = append(result, parsed)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("empty integer list")
+	}
+	return result, nil
+}
+
+func mbps(bytes int, seconds float64) float64 {
+	if seconds <= 0 {
+		return 0
+	}
+	return float64(bytes*8) / seconds / 1_000_000
 }
 
 func serveClient(ctx context.Context, args []string) error {

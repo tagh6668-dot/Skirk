@@ -52,3 +52,26 @@ func TestHybridSendReceiveWithMemoryStores(t *testing.T) {
 		t.Fatalf("delete-after left %d data objects", len(infos))
 	}
 }
+
+func TestHybridSendDoesNotAddEmptyFinalForExactChunk(t *testing.T) {
+	ctx := context.Background()
+	data := NewMemoryStore()
+	control := NewMemoryStore()
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input.bin")
+	payload := bytes.Repeat([]byte{0x42}, 8192)
+	if err := os.WriteFile(input, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := RandomSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	send, err := HybridSendFile(ctx, data, control, input, secret, "", DirectionUp, 8192, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if send.Chunks != 1 {
+		t.Fatalf("expected one exact-size final chunk, got %d", send.Chunks)
+	}
+}
