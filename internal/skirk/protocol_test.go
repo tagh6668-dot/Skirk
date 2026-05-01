@@ -1,0 +1,48 @@
+package skirk
+
+import (
+	"bytes"
+	"testing"
+)
+
+func TestSealOpenEnvelope(t *testing.T) {
+	key, err := DeriveKey("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := ParseSessionID("00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("hello skirk")
+	sealed, err := Seal(key, sid, DirectionUp, 7, plaintext, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, opened, err := OpenEnvelope(key, sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(opened, plaintext) {
+		t.Fatalf("plaintext mismatch: got %q", opened)
+	}
+	if env.SessionID != sid || env.Direction != DirectionUp || env.Sequence != 7 || env.Flags != FlagFinal {
+		t.Fatalf("metadata mismatch: %+v", env)
+	}
+}
+
+func TestOpenEnvelopeRejectsTamper(t *testing.T) {
+	key, err := DeriveKey("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := ParseSessionID("00112233445566778899aabbccddeeff")
+	sealed, err := Seal(key, sid, DirectionUp, 1, []byte("payload"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed[len(sealed)-1] ^= 0x01
+	if _, _, err := OpenEnvelope(key, sealed); err == nil {
+		t.Fatal("expected tampered envelope to fail authentication")
+	}
+}

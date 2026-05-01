@@ -1,0 +1,26 @@
+{
+  "secret": "base64:REPLACE_WITH_OUTPUT_FROM_SKIRK_KEYGEN",
+  "session_id": "00112233445566778899aabbccddeeff",
+  "auth": {
+    "token_command": "gcloud auth print-access-token"
+  },
+  "route": {
+    "mode": "real_pinned",
+    "proxy": "socks5h://127.0.0.1:1080",
+    "google_ip": "216.239.38.120",
+    "timeout_seconds": 240
+  },
+  "drive": {
+    "folder_id": ""
+  },
+  "sheets": {
+    "spreadsheet_id": "REPLACE_WITH_WORKSPACE_SPREADSHEET_ID",
+    "range": "skirk!A:D"
+  },
+  "tunnel": {
+    "listen": "127.0.0.1:18080",
+    "chunk_size": 8192,
+    "poll_interval_ms": 1200,
+    "cleanup_processed": true
+  }
+}

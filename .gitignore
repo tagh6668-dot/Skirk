@@ -1,0 +1,24 @@
+# Local/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and generated configs
+skirk.json
+*.secret
+*.token
+
+# Probe/build artifacts
+probe_results/
+cloud_resources/
+cloudrun_probe/__pycache__/
+
+# Bundled research inputs are kept locally but not committed to the Skirk code repo.
+sources/
+zips/
+skirk_research_bundle/
+skirk_research_bundle.zip
+
+# Go build outputs
+/bin/
+coverage.out
